@@ -52,10 +52,15 @@ pub trait OperationGenerator: Send + 'static {
 pub struct NativeFungibleTransferGenerator {
     source_chain_id: ChainId,
     destination_chains: Vec<ChainId>,
+    /// Count of *distinct* chain IDs in `destination_chains`. Traffic modes like `mixed` build
+    /// that list with intentional duplicates (e.g. the source chain repeated once per other
+    /// chain, to weight self-traffic at 50%), so this is not simply `destination_chains.len()`.
+    distinct_destination_count: usize,
     destination_index: usize,
     rng: SmallRng,
     single_destination_per_block: bool,
     avoid_self: bool,
+    max_destinations_per_block: Option<usize>,
 }
 
 impl NativeFungibleTransferGenerator {
@@ -66,11 +71,21 @@ impl NativeFungibleTransferGenerator {
     /// self- and cross-chain traffic should build a destination list that already includes
     /// `source_chain_id` explicitly and pass `avoid_self = false`, otherwise it would never
     /// actually be selected).
+    ///
+    /// `max_destinations_per_block`, if set, caps how many *distinct* chains one block's
+    /// transfers are spread across, regardless of the block's transaction count or the size of
+    /// `destination_chains`: each block picks a fresh subset of at most that many chains (via
+    /// `next_destination`, so the subset still rotates fairly across blocks) and cycles through
+    /// just that subset. Without a cap, a block with more transactions than
+    /// `destination_chains.len()` touches every destination at least once, so cross-chain
+    /// fan-out scales with the destination pool's size (e.g. with the chain count in `mixed`/
+    /// `full` traffic modes) rather than staying bounded.
     pub fn new(
         source_chain_id: ChainId,
         mut destination_chains: Vec<ChainId>,
         single_destination_per_block: bool,
         avoid_self: bool,
+        max_destinations_per_block: Option<usize>,
     ) -> Result<Self, BenchmarkError> {
         // With a single chain, send to self.
         if destination_chains.is_empty() {
@@ -78,13 +93,20 @@ impl NativeFungibleTransferGenerator {
         }
         let mut rng = SmallRng::from_rng(thread_rng())?;
         destination_chains.shuffle(&mut rng);
+        let distinct_destination_count = destination_chains
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         Ok(Self {
             source_chain_id,
             destination_chains,
+            distinct_destination_count,
             destination_index: 0,
             rng,
             single_destination_per_block,
             avoid_self,
+            max_destinations_per_block,
         })
     }
 
@@ -105,32 +127,64 @@ impl NativeFungibleTransferGenerator {
             destination_chain_id
         }
     }
+
+    /// Picks `max` distinct chains (drawn via `next_destination`, so the choice rotates fairly
+    /// across successive blocks) and returns every occurrence of each chosen chain from
+    /// `destination_chains`, in its original order -- preserving each chain's original relative
+    /// weight (e.g. `mixed` traffic's self-chain, which appears many times) among the chains
+    /// that survive the cap, rather than flattening everything to one copy each.
+    ///
+    /// Only called when `max < self.distinct_destination_count`, i.e. when the cap is actually
+    /// binding; `generate_operations` takes a cheaper, weighting-exact path otherwise.
+    fn next_destination_subset(&mut self, max: usize) -> Vec<ChainId> {
+        let mut chosen = std::collections::HashSet::with_capacity(max);
+        // `avoid_self` can make some entries unreachable (self is skipped whenever there's at
+        // least one other choice), so `max` distinct chains aren't always attainable; bound the
+        // search rather than looping forever chasing an unreachable count.
+        let attempt_limit = max.saturating_mul(4).max(16);
+        for _ in 0..attempt_limit {
+            if chosen.len() >= max {
+                break;
+            }
+            chosen.insert(self.next_destination());
+        }
+        self.destination_chains
+            .iter()
+            .copied()
+            .filter(|id| chosen.contains(id))
+            .collect()
+    }
 }
 
 impl OperationGenerator for NativeFungibleTransferGenerator {
     fn generate_operations(&mut self, _owner: AccountOwner, count: usize) -> Vec<Operation> {
         let amount = Amount::from_attos(1);
+        let transfer_op = |recipient: ChainId| {
+            Operation::system(SystemOperation::Transfer {
+                owner: AccountOwner::CHAIN,
+                recipient: Account::chain(recipient),
+                amount,
+            })
+        };
         if self.single_destination_per_block {
             let recipient = self.next_destination();
-            (0..count)
-                .map(|_| {
-                    Operation::system(SystemOperation::Transfer {
-                        owner: AccountOwner::CHAIN,
-                        recipient: Account::chain(recipient),
-                        amount,
-                    })
-                })
-                .collect()
+            (0..count).map(|_| transfer_op(recipient)).collect()
+        } else if let Some(max) = self.max_destinations_per_block {
+            if max >= self.distinct_destination_count {
+                // The cap isn't actually binding: behave exactly as without one, including
+                // `mixed` traffic's intentional per-chain weighting (e.g. 50% self-traffic).
+                (0..count)
+                    .map(|_| transfer_op(self.next_destination()))
+                    .collect()
+            } else {
+                let block_destinations = self.next_destination_subset(max);
+                (0..count)
+                    .map(|i| transfer_op(block_destinations[i % block_destinations.len()]))
+                    .collect()
+            }
         } else {
             (0..count)
-                .map(|_| {
-                    let recipient = self.next_destination();
-                    Operation::system(SystemOperation::Transfer {
-                        owner: AccountOwner::CHAIN,
-                        recipient: Account::chain(recipient),
-                        amount,
-                    })
-                })
+                .map(|_| transfer_op(self.next_destination()))
                 .collect()
         }
     }

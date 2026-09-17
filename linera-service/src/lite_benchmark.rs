@@ -213,6 +213,15 @@ struct Args {
     #[arg(long)]
     single_destination_per_block: bool,
 
+    /// Cap how many distinct chains one block's transfers are spread across, regardless of the
+    /// block's transaction count or how many chains are in play. Without a cap, a block with
+    /// more transactions than the destination pool touches every destination at least once, so
+    /// cross-chain fan-out (and the resulting message-delivery/certificate work) scales with the
+    /// number of chains in `mixed`/`full` traffic modes rather than staying bounded. Only
+    /// affects `mixed`/`full`; ignored (and unset) together with --single-destination-per-block.
+    #[arg(long)]
+    max_destinations_per_block: Option<usize>,
+
     /// Extra chains to address mixed/full traffic-mode messages to, in addition to --chains,
     /// without giving them their own run_chain task -- no traffic ever originates from them,
     /// so they don't consume any of the actively-benchmarked chains' shard capacity. Useful
@@ -529,6 +538,7 @@ async fn run(args: Args) -> Result<()> {
             destinations,
             args.single_destination_per_block,
             avoid_self,
+            args.max_destinations_per_block,
         )
         .map_err(|error| anyhow!("failed to create the operation generator: {error}"))?;
         // Either the same size for every block, or this chain's own random starting offset
@@ -788,6 +798,19 @@ async fn run_chain(
     // truncate an intended-nonzero rate to exactly 0, silently stopping this chain's traffic
     // forever (until the schedule moves to a large-enough rate again) instead of just ticking
     // slowly.
+    //
+    // Every rebuild is anchored to this chain's own fixed `phase_anchor` (set once, right
+    // after the initial de-sync sleep above), not to "now": `time::interval(period)` starts
+    // ticking from whenever it's constructed, so anchoring to "now" on every rate change
+    // discards the de-sync stagger and re-synchronizes this chain's phase with every other
+    // chain's -- harmless after one transition, but a multi-breakpoint --bps-schedule rebuilds
+    // every chain's interval repeatedly, and each rebuild is another chance to converge onto
+    // the same phase. Confirmed experimentally on a 15-breakpoint schedule: sub-second request
+    // timing that started evenly spread across a whole second had collapsed, by the end of the
+    // run, into 74% of a second's requests landing in the same 100ms window -- a genuine
+    // thundering herd against the validator that looked like a server-side regression until
+    // traced back here.
+    let phase_anchor = time::Instant::now();
     let mut ticking_at = 0.0_f64;
     let mut interval: Option<time::Interval> = None;
     loop {
@@ -798,7 +821,12 @@ async fn run_chain(
         if bps != ticking_at {
             ticking_at = bps;
             interval = if bps > 0.0 {
-                let mut new_interval = time::interval(Duration::from_secs_f64(1.0 / bps));
+                let period = Duration::from_secs_f64(1.0 / bps);
+                let period_secs = period.as_secs_f64();
+                let elapsed = time::Instant::now().saturating_duration_since(phase_anchor);
+                let periods_elapsed = (elapsed.as_secs_f64() / period_secs).ceil();
+                let next_tick = phase_anchor + Duration::from_secs_f64(periods_elapsed * period_secs);
+                let mut new_interval = time::interval_at(next_tick, period);
                 // The default (`Burst`) fires every missed tick back-to-back with no pacing
                 // gap once behind schedule, trying to catch up to the *original* schedule --
                 // fine when the target period has huge headroom over real block latency (as
