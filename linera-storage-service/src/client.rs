@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    collections::HashSet,
     mem,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -69,6 +70,12 @@ pub struct StorageServiceDatabaseInternal {
     channel: Channel,
     semaphore: Option<Arc<Semaphore>>,
     namespace: Vec<u8>,
+    // Root keys already confirmed present on the server, so `open_shared` doesn't need to
+    // re-queue the "root key exists" marker Put on every call -- without this, a long-lived
+    // chain re-sends that marker on every single block, since each `open_shared` call
+    // otherwise starts from a fresh `root_key_written = false` with no memory of prior calls
+    // for the same root key.
+    known_root_keys: Arc<Mutex<HashSet<Vec<u8>>>>,
 }
 
 /// A store within a namespace and root key, backed by a remote storage service.
@@ -78,6 +85,8 @@ pub struct StorageServiceStoreInternal {
     semaphore: Option<Arc<Semaphore>>,
     prefix_len: usize,
     start_key: Vec<u8>,
+    root_key: Vec<u8>,
+    known_root_keys: Arc<Mutex<HashSet<Vec<u8>>>>,
     root_key_written: Arc<AtomicBool>,
 }
 
@@ -286,7 +295,9 @@ impl WritableKeyValueStore for StorageServiceStoreInternal {
         let mut statements = Vec::new();
         let mut chunk_size = 0;
 
-        if !self.root_key_written.fetch_or(true, Ordering::SeqCst) {
+        let is_first_write_on_this_root_key =
+            !self.root_key_written.fetch_or(true, Ordering::SeqCst);
+        if is_first_write_on_this_root_key {
             let mut full_key = self.start_key.clone();
             full_key[0] = KeyPrefix::RootKey as u8;
             let operation = Operation::Put(KeyValue {
@@ -352,7 +363,17 @@ impl WritableKeyValueStore for StorageServiceStoreInternal {
                 }
             }
         }
-        self.submit_statements(mem::take(&mut statements)).await
+        self.submit_statements(mem::take(&mut statements)).await?;
+        if is_first_write_on_this_root_key {
+            // Only remember the root key as known once its marker Put has actually been
+            // confirmed sent -- an early failure above must not poison the cache with a root
+            // key whose marker never made it to the server.
+            self.known_root_keys
+                .lock()
+                .unwrap()
+                .insert(self.root_key.clone());
+        }
+        Ok(())
     }
 
     async fn clear_journal(&self) -> Result<(), StorageServiceStoreError> {
@@ -473,6 +494,7 @@ impl KeyValueDatabase for StorageServiceDatabaseInternal {
             channel,
             semaphore,
             namespace,
+            known_root_keys: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -483,12 +505,15 @@ impl KeyValueDatabase for StorageServiceDatabaseInternal {
         start_key.extend(&self.namespace);
         start_key.extend(bcs::to_bytes(root_key)?);
         let prefix_len = self.namespace.len() + 1;
+        let already_known = self.known_root_keys.lock().unwrap().contains(root_key);
         Ok(StorageServiceStoreInternal {
             channel,
             semaphore,
             prefix_len,
             start_key,
-            root_key_written: Arc::new(AtomicBool::new(false)),
+            root_key: root_key.to_vec(),
+            known_root_keys: self.known_root_keys.clone(),
+            root_key_written: Arc::new(AtomicBool::new(already_known)),
         })
     }
 
