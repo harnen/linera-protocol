@@ -28,6 +28,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
+    future::Future,
     io::Write as _,
     path::PathBuf,
     sync::{
@@ -39,7 +40,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use clap::Parser;
-use futures::future::join_all;
+use futures::{future::join_all, stream::FuturesUnordered, StreamExt as _};
 use linera_base::{
     crypto::{CryptoHash, InMemorySigner, Signer as _, ValidatorPublicKey, ValidatorSignature},
     data_types::{Epoch, Round, Timestamp},
@@ -199,6 +200,17 @@ struct Args {
     /// (see `RemoteNode::handle_optimized_confirmed_certificate`). Off by default.
     #[arg(long)]
     light_certificates: bool,
+
+    /// Each block's validator round trips stop as soon as a quorum has responded, instead of
+    /// waiting for literally every validator in the committee -- mirrors
+    /// `linera_core::updater::communicate_with_quorum`'s own early-stop + grace-period
+    /// behavior, which the real production client already benefits from. A separate benchmark
+    /// mode, not a drop-in replacement: existing results used the wait-for-everyone behavior,
+    /// so this must be set explicitly per run. Also changes the initial per-chain seed query to
+    /// race all validators instead of trying them one at a time, so the client can start up
+    /// (and keep running) against a chain with dead validators in its committee.
+    #[arg(long)]
+    quorum_only: bool,
 
     /// Which client drives the benchmark -- lite (default, 3 RTTs/block) or full (2
     /// RTTs/block, real local execution). See `ClientMode`'s doc comment.
@@ -433,6 +445,7 @@ async fn run(args: Args) -> Result<()> {
                     committee.clone(),
                     signer.clone(),
                     args.light_certificates,
+                    args.quorum_only,
                 )
                 .await
                 .with_context(|| {
@@ -915,10 +928,19 @@ struct LiteChainClient {
     /// Whether to broadcast the confirmed certificate in its compact, value-free form where
     /// possible (see `--light-certificates`).
     light_certificates: bool,
+    /// Whether every round trip races all validators and stops at a quorum instead of waiting
+    /// for literally everyone (see `--quorum-only`).
+    quorum_only: bool,
 }
 
 impl LiteChainClient {
-    /// Seeds the client's state for `chain_id` from the first validator that answers.
+    /// Seeds the client's state for `chain_id` from the first validator that answers. With
+    /// `quorum_only`, races all validators via `FuturesUnordered` and takes the first success,
+    /// instead of trying them one at a time in committee order -- the sequential fallback hangs
+    /// forever if a dead validator's key happens to sort before any live one's (a dead gRPC
+    /// target's channel retries the TCP connection forever, so the call never resolves either
+    /// way). `quorum_only` gates this so the default path's behavior stays byte-for-byte
+    /// unchanged.
     async fn seed(
         chain_id: ChainId,
         owner: AccountOwner,
@@ -926,7 +948,47 @@ impl LiteChainClient {
         committee: Committee,
         signer: InMemorySigner,
         light_certificates: bool,
+        quorum_only: bool,
     ) -> Result<Self> {
+        if quorum_only {
+            let mut pending: FuturesUnordered<_> = nodes
+                .iter()
+                .map(|(public_key, node)| {
+                    let public_key = *public_key;
+                    let node = node.clone();
+                    let query = ChainInfoQuery::new(chain_id);
+                    async move { (public_key, node.handle_chain_info_query(query).await) }
+                })
+                .collect();
+            while let Ok(Some((public_key, result))) =
+                time::timeout(Duration::from_secs(60), pending.next()).await
+            {
+                match result {
+                    Ok(response) => {
+                        let info = response.info;
+                        drop(pending);
+                        return Ok(Self {
+                            chain_id,
+                            owner,
+                            epoch: info.epoch,
+                            height: info.next_block_height,
+                            previous_block_hash: info.block_hash,
+                            nodes,
+                            committee,
+                            signer,
+                            value_cache: ValueCache::new("lite-benchmark", 64, 60),
+                            pending_bundles: Vec::new(),
+                            light_certificates,
+                            quorum_only,
+                        });
+                    }
+                    Err(error) => {
+                        warn!(%public_key, %error, "validator did not answer the initial chain info query");
+                    }
+                }
+            }
+            bail!("no validator answered the initial chain info query");
+        }
         for (public_key, node) in &nodes {
             let query = ChainInfoQuery::new(chain_id);
             match node.handle_chain_info_query(query).await {
@@ -944,6 +1006,7 @@ impl LiteChainClient {
                         value_cache: ValueCache::new("lite-benchmark", 64, 60),
                         pending_bundles: Vec::new(),
                         light_certificates,
+                        quorum_only,
                     });
                 }
                 Err(error) => {
@@ -1011,13 +1074,29 @@ impl LiteChainClient {
             .map_err(|error| anyhow!("failed to sign the block proposal: {error}"))?;
 
         // Broadcast the proposal to every validator and collect their `ConfirmedBlock` votes.
-        let responses = join_all(self.nodes.iter().map(|(public_key, node)| {
-            let proposal = proposal.clone();
-            let public_key = *public_key;
-            let node = node.clone();
-            async move { (public_key, node.handle_block_proposal(proposal).await) }
-        }))
-        .await;
+        // With --quorum-only, race all validators and stop once a quorum's worth of weight has
+        // responded (plus a short grace period for stragglers), instead of waiting for
+        // literally everyone -- see `race_to_quorum`.
+        let responses = if self.quorum_only {
+            race_to_quorum(
+                self.nodes.iter().map(|(public_key, node)| {
+                    let proposal = proposal.clone();
+                    let public_key = *public_key;
+                    let node = node.clone();
+                    (public_key, async move { node.handle_block_proposal(proposal).await })
+                }),
+                &self.committee,
+            )
+            .await
+        } else {
+            join_all(self.nodes.iter().map(|(public_key, node)| {
+                let proposal = proposal.clone();
+                let public_key = *public_key;
+                let node = node.clone();
+                async move { (public_key, node.handle_block_proposal(proposal).await) }
+            }))
+            .await
+        };
         let votes = responses
             .into_iter()
             .filter_map(|(public_key, result)| match result {
@@ -1067,41 +1146,76 @@ impl LiteChainClient {
         // certificate (see that method's doc comment). This only shrinks this round trip's
         // payload; it doesn't remove it.
         let light_certificates = self.light_certificates;
-        let results = join_all(self.nodes.iter().map(|(public_key, node)| {
-            let node = node.clone();
-            let cached_certificate = cached_certificate.clone();
-            async move {
-                if light_certificates {
-                    let remote_node = RemoteNode {
-                        public_key: *public_key,
-                        node,
-                    };
-                    remote_node
-                        .handle_optimized_confirmed_certificate(
-                            &cached_certificate,
+        // With --quorum-only, only one validator needs to accept the certificate for the block
+        // to commit, so race all validators and stop at the very first acceptance -- no weight
+        // threshold or grace period needed here (unlike the vote round above), see
+        // `race_to_first_success`.
+        let committed = if self.quorum_only {
+            race_to_first_success(self.nodes.iter().map(|(public_key, node)| {
+                let node = node.clone();
+                let cached_certificate = cached_certificate.clone();
+                async move {
+                    if light_certificates {
+                        let remote_node = RemoteNode {
+                            public_key: *public_key,
+                            node,
+                        };
+                        remote_node
+                            .handle_optimized_confirmed_certificate(
+                                &cached_certificate,
+                                CrossChainMessageDelivery::NonBlocking,
+                            )
+                            .await
+                            .map(|_| ())
+                    } else {
+                        node.handle_confirmed_certificate(
+                            cached_certificate,
                             CrossChainMessageDelivery::NonBlocking,
                         )
                         .await
                         .map(|_| ())
+                    }
+                }
+            }))
+            .await
+        } else {
+            let results = join_all(self.nodes.iter().map(|(public_key, node)| {
+                let node = node.clone();
+                let cached_certificate = cached_certificate.clone();
+                async move {
+                    if light_certificates {
+                        let remote_node = RemoteNode {
+                            public_key: *public_key,
+                            node,
+                        };
+                        remote_node
+                            .handle_optimized_confirmed_certificate(
+                                &cached_certificate,
+                                CrossChainMessageDelivery::NonBlocking,
+                            )
+                            .await
+                            .map(|_| ())
+                    } else {
+                        node.handle_confirmed_certificate(
+                            cached_certificate,
+                            CrossChainMessageDelivery::NonBlocking,
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                }
+            }))
+            .await;
+            let mut committed = false;
+            for result in results {
+                if let Err(error) = result {
+                    warn!(%error, "validator failed to process the confirmed certificate");
                 } else {
-                    node.handle_confirmed_certificate(
-                        cached_certificate,
-                        CrossChainMessageDelivery::NonBlocking,
-                    )
-                    .await
-                    .map(|_| ())
+                    committed = true;
                 }
             }
-        }))
-        .await;
-        let mut committed = false;
-        for result in results {
-            if let Err(error) = result {
-                warn!(%error, "validator failed to process the confirmed certificate");
-            } else {
-                committed = true;
-            }
-        }
+            committed
+        };
         anyhow::ensure!(committed, "no validator accepted the confirmed certificate");
 
         self.previous_block_hash = Some(certificate.hash());
@@ -1134,25 +1248,58 @@ impl LiteChainClient {
         process_messages: bool,
         consumed: &HashSet<(ChainId, linera_base::data_types::Cursor)>,
     ) -> Result<(ConfirmedBlock, Vec<IncomingBundle>)> {
-        let responses = join_all(self.nodes.iter().map(|(public_key, node)| {
-            let node = node.clone();
-            let mut query = ChainInfoQuery::new(self.chain_id);
-            query.request_manager_values = true;
-            if process_messages {
-                query = query.with_pending_message_bundles();
-            }
-            let public_key = *public_key;
-            async move {
-                match node.handle_chain_info_query(query).await {
-                    Ok(response) => Some(response.info),
-                    Err(error) => {
-                        warn!(%public_key, %error, "validator did not answer the confirmed-value query");
-                        None
+        // With --quorum-only, race all validators and stop once a quorum's worth of weight has
+        // responded (plus a short grace period), instead of waiting for literally everyone --
+        // same `race_to_quorum` mechanism as the vote round, counting weight per *responding*
+        // validator (not a raw response count, which would compare against the wrong scale --
+        // `Committee::quorum_threshold()` is a vote-weight sum, not a validator count).
+        let responses: Vec<Option<_>> = if self.quorum_only {
+            race_to_quorum(
+                self.nodes.iter().map(|(public_key, node)| {
+                    let node = node.clone();
+                    let mut query = ChainInfoQuery::new(self.chain_id);
+                    query.request_manager_values = true;
+                    if process_messages {
+                        query = query.with_pending_message_bundles();
+                    }
+                    let public_key = *public_key;
+                    (public_key, async move {
+                        match node.handle_chain_info_query(query).await {
+                            Ok(response) => Some(response.info),
+                            Err(error) => {
+                                warn!(%public_key, %error, "validator did not answer the confirmed-value query");
+                                None
+                            }
+                        }
+                    })
+                }),
+                &self.committee,
+            )
+            .await
+            .into_iter()
+            .map(|(_, info)| info)
+            .collect()
+        } else {
+            join_all(self.nodes.iter().map(|(public_key, node)| {
+                let node = node.clone();
+                let mut query = ChainInfoQuery::new(self.chain_id);
+                query.request_manager_values = true;
+                if process_messages {
+                    query = query.with_pending_message_bundles();
+                }
+                let public_key = *public_key;
+                async move {
+                    match node.handle_chain_info_query(query).await {
+                        Ok(response) => Some(response.info),
+                        Err(error) => {
+                            warn!(%public_key, %error, "validator did not answer the confirmed-value query");
+                            None
+                        }
                     }
                 }
-            }
-        }))
-        .await;
+            }))
+            .await
+        };
 
         let mut confirmed_block: Option<ConfirmedBlock> = None;
         let mut per_node: Vec<Vec<IncomingBundle>> = Vec::new();
@@ -1224,6 +1371,72 @@ fn common_prefix_bundles(per_node: Vec<Vec<IncomingBundle>>) -> Vec<IncomingBund
         result.extend(base_bundles.into_iter().take(prefix_len));
     }
     result
+}
+
+/// Races `requests` (each paired with the validator's public key, for weighing) via
+/// `FuturesUnordered`, stopping once the combined `committee` weight of validators that have
+/// *responded* (successfully or not -- this is about not waiting for literally everyone, not
+/// about only trusting agreeing responses) reaches `committee.quorum_threshold()`, then waits a
+/// short grace period (10% of the elapsed time to reach that point, floored at 5ms) for a few
+/// more stragglers before returning everything collected so far. Mirrors
+/// `linera_core::updater::communicate_with_quorum`'s own early-stop + grace-period mechanism.
+/// Bounded by an overall 60s ceiling per response so a dead validator (whose gRPC channel
+/// retries the TCP connection forever and so never resolves `Ok` or `Err`) cannot hang this
+/// forever even if quorum is never reached. Only used in `--quorum-only` mode; the
+/// non-quorum-only path still uses `join_all`, so its behavior is unaffected.
+async fn race_to_quorum<F, T>(
+    requests: impl IntoIterator<Item = (ValidatorPublicKey, F)>,
+    committee: &Committee,
+) -> Vec<(ValidatorPublicKey, T)>
+where
+    F: Future<Output = T>,
+{
+    let mut pending: FuturesUnordered<_> = requests
+        .into_iter()
+        .map(|(public_key, fut)| async move { (public_key, fut.await) })
+        .collect();
+
+    let start = Instant::now();
+    let mut end_time: Option<Instant> = None;
+    let mut responded_weight: u64 = 0;
+    let mut results = Vec::new();
+
+    loop {
+        let remaining = end_time.map_or(Duration::from_secs(60), |t| {
+            t.saturating_duration_since(Instant::now())
+        });
+        match time::timeout(remaining, pending.next()).await {
+            Ok(Some((public_key, value))) => {
+                responded_weight += committee.weight(&public_key);
+                results.push((public_key, value));
+                if end_time.is_none() && responded_weight >= committee.quorum_threshold() {
+                    let grace = start.elapsed().mul_f64(0.1).max(Duration::from_millis(5));
+                    end_time = Some(Instant::now() + grace);
+                }
+            }
+            // Either every future resolved, or the overall ceiling / grace period elapsed.
+            Ok(None) | Err(_) => break,
+        }
+    }
+    results
+}
+
+/// Races `requests` via `FuturesUnordered` and returns as soon as the first one succeeds, or
+/// `false` once every one has failed or the 60s per-response ceiling elapses. Used for the
+/// certificate-broadcast round in `--quorum-only` mode: only one validator needs to accept the
+/// certificate for the block to commit, so there is no quorum-weight threshold or grace period
+/// here, unlike `race_to_quorum`.
+async fn race_to_first_success<F, T, E>(requests: impl IntoIterator<Item = F>) -> bool
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let mut pending: FuturesUnordered<_> = requests.into_iter().collect();
+    while let Ok(Some(result)) = time::timeout(Duration::from_secs(60), pending.next()).await {
+        if result.is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Groups the given validator votes by the `ConfirmedBlock` value hash they attest to, and
